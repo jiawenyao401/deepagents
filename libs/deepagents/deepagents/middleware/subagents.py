@@ -1,4 +1,8 @@
-"""Middleware for providing subagents to an agent via a `task` tool."""
+"""通过 task 工具向 Agent 提供子代理能力的中间件。
+
+本模块实现了 SubAgentMiddleware，向主 Agent 注入 task 工具，
+使其能够将复杂、多步骤的任务委派给短暂的子代理处理。
+"""
 
 import warnings
 from collections.abc import Awaitable, Callable, Sequence
@@ -20,110 +24,83 @@ from deepagents.middleware._utils import append_to_system_message
 
 
 class SubAgent(TypedDict):
-    """Specification for an agent.
+    """子代理的配置规格。
 
-    When using `create_deep_agent`, subagents automatically receive a default middleware
-    stack (TodoListMiddleware, FilesystemMiddleware, SummarizationMiddleware, etc.) before
-    any custom `middleware` specified in this spec.
+    使用 create_deep_agent 时，子代理会在自定义 middleware 之前自动接收默认中间件栈
+    （TodoListMiddleware、FilesystemMiddleware、SummarizationMiddleware 等）。
 
-    Required fields:
-        name: Unique identifier for the subagent.
+    必填字段：
+        name: 子代理的唯一标识符，主 Agent 调用 task() 工具时使用此名称。
+        description: 子代理的功能描述，主 Agent 用此决定何时委派任务。
+        system_prompt: 子代理的指令，应包含工具使用指南和输出格式要求。
 
-            The main agent uses this name when calling the `task()` tool.
-        description: What this subagent does.
-
-            Be specific and action-oriented. The main agent uses this to decide when to delegate.
-        system_prompt: Instructions for the subagent.
-
-            Include tool usage guidance and output format requirements.
-
-    Optional fields:
-        tools: Tools the subagent can use.
-
-            If not specified, inherits tools from the main agent via `default_tools`.
-        model: Override the main agent's model.
-
-            Use the format `'provider:model-name'` (e.g., `'openai:gpt-4o'`).
-        middleware: Additional middleware for custom behavior, logging, or rate limiting.
-        interrupt_on: Configure human-in-the-loop for specific tools.
-
-            Requires a checkpointer.
-        skills: Skill source paths for SkillsMiddleware.
-
-            List of paths to skill directories (e.g., `["/skills/user/", "/skills/project/"]`).
+    可选字段：
+        tools: 子代理可用的工具列表，未指定时继承主 Agent 的工具。
+        model: 覆盖主 Agent 的模型，格式为 'provider:model-name'。
+        middleware: 附加中间件，用于自定义行为、日志或限流。
+        interrupt_on: 配置特定工具的人工审批（需要检查点）。
+        skills: SkillsMiddleware 的技能来源路径列表。
     """
 
     name: str
-    """Unique identifier for the subagent."""
+    """子代理的唯一标识符。"""
 
     description: str
-    """What this subagent does. The main agent uses this to decide when to delegate."""
+    """子代理的功能描述，主 Agent 用此决定何时委派任务。"""
 
     system_prompt: str
-    """Instructions for the subagent."""
+    """子代理的指令。"""
 
     tools: NotRequired[Sequence[BaseTool | Callable | dict[str, Any]]]
-    """Tools the subagent can use. If not specified, inherits from main agent."""
+    """子代理可用的工具列表，未指定时继承主 Agent 的工具。"""
 
     model: NotRequired[str | BaseChatModel]
-    """Override the main agent's model. Use `'provider:model-name'` format."""
+    """覆盖主 Agent 的模型，使用 'provider:model-name' 格式。"""
 
     middleware: NotRequired[list[AgentMiddleware]]
-    """Additional middleware for custom behavior."""
+    """附加中间件，用于自定义行为。"""
 
     interrupt_on: NotRequired[dict[str, bool | InterruptOnConfig]]
-    """Configure human-in-the-loop for specific tools."""
+    """配置特定工具的人工审批。"""
 
     skills: NotRequired[list[str]]
-    """Skill source paths for SkillsMiddleware."""
+    """SkillsMiddleware 的技能来源路径列表。"""
 
 
 class CompiledSubAgent(TypedDict):
-    """A pre-compiled agent spec.
+    """预编译的子代理规格。
 
-    !!! note
+    注意：runnable 的状态模式必须包含 'messages' 键，
+    这是子代理将结果传回主 Agent 的必要条件。
 
-        The runnable's state schema must include a 'messages' key.
-
-        This is required for the subagent to communicate results back to the main agent.
-
-    When the subagent completes, the final message in the 'messages' list will be
-    extracted and returned as a `ToolMessage` to the parent agent.
+    子代理完成后，'messages' 列表中的最后一条消息会被提取
+    并以 ToolMessage 的形式返回给父 Agent。
     """
 
     name: str
-    """Unique identifier for the subagent."""
+    """子代理的唯一标识符。"""
 
     description: str
-    """What this subagent does."""
+    """子代理的功能描述。"""
 
     runnable: Runnable
-    """A custom agent implementation.
+    """自定义 Agent 实现。
 
-    Create a custom agent using either:
-
-    1. LangChain's [`create_agent()`](https://docs.langchain.com/oss/python/langchain/quickstart)
-    2. A custom graph using [`langgraph`](https://docs.langchain.com/oss/python/langgraph/quickstart)
-
-    If you're creating a custom graph, make sure the state schema includes a 'messages' key.
-    This is required for the subagent to communicate results back to the main agent.
+    可使用以下方式创建：
+    1. LangChain 的 create_agent()
+    2. 使用 langgraph 的自定义图（状态模式必须包含 'messages' 键）
     """
 
 
 DEFAULT_SUBAGENT_PROMPT = "In order to complete the objective that the user asks of you, you have access to a number of standard tools."
 
-# State keys that are excluded when passing state to subagents and when returning
-# updates from subagents.
+# 向子代理传递状态以及从子代理返回更新时需要排除的状态键。
 #
-# When returning updates:
-# 1. The messages key is handled explicitly to ensure only the final message is included
-# 2. The todos and structured_response keys are excluded as they do not have a defined reducer
-#    and no clear meaning for returning them from a subagent to the main agent.
-# 3. The skills_metadata and memory_contents keys are automatically excluded from subagent output
-#    via PrivateStateAttr annotations on their respective state schemas. However, they must ALSO
-#    be explicitly filtered from runtime.state when invoking a subagent to prevent parent state
-#    from leaking to child agents (e.g., the general-purpose subagent loads its own skills via
-#    SkillsMiddleware).
+# 返回更新时：
+# 1. messages 键单独处理，确保只包含最后一条消息
+# 2. todos 和 structured_response 键没有定义的 reducer，且从子代理返回无意义
+# 3. skills_metadata 和 memory_contents 通过 PrivateStateAttr 自动排除，
+#    但也必须在调用子代理时显式过滤，防止父状态泄漏到子代理
 _EXCLUDED_STATE_KEYS = {"messages", "todos", "structured_response", "skills_metadata", "memory_contents"}
 
 TASK_TOOL_DESCRIPTION = """Launch an ephemeral subagent to handle complex, multi-step independent tasks with isolated context windows.
@@ -292,20 +269,18 @@ def _get_subagents_legacy(
     subagents: list[SubAgent | CompiledSubAgent],
     general_purpose_agent: bool,
 ) -> list[_SubagentSpec]:
-    """Create subagent instances from specifications.
+    """从规格创建子代理实例（旧版 API）。
 
     Args:
-        default_model: Default model for subagents that don't specify one.
-        default_tools: Default tools for subagents that don't specify tools.
-        default_middleware: Middleware to apply to all subagents. If `None`,
-            no default middleware is applied.
-        default_interrupt_on: The tool configs to use for the default general-purpose subagent. These
-            are also the fallback for any subagents that don't specify their own tool configs.
-        subagents: List of agent specifications or pre-compiled agents.
-        general_purpose_agent: Whether to include a general-purpose subagent.
+        default_model: 未指定模型的子代理使用的默认模型。
+        default_tools: 未指定工具的子代理使用的默认工具。
+        default_middleware: 应用于所有子代理的中间件，None 表示不应用。
+        default_interrupt_on: 默认通用子代理的工具配置，也是未指定工具配置的子代理的回退选项。
+        subagents: Agent 规格或预编译 Agent 的列表。
+        general_purpose_agent: 是否包含通用子代理。
 
     Returns:
-        List of subagent specs containing name, description, and runnable.
+        包含 name、description 和 runnable 的子代理规格列表。
     """
     # Use empty list if None (no default middleware)
     default_subagent_middleware = default_middleware or []
@@ -375,17 +350,17 @@ def _build_task_tool(  # noqa: C901
     subagents: list[_SubagentSpec],
     task_description: str | None = None,
 ) -> BaseTool:
-    """Create a task tool from pre-built subagent graphs.
+    """从预构建的子代理图创建 task 工具。
 
-    This is the shared implementation used by both the legacy API and new API.
+    旧版 API 和新版 API 共用的实现。
 
     Args:
-        subagents: List of subagent specs containing name, description, and runnable.
-        task_description: Custom description for the task tool. If `None`,
-            uses default template. Supports `{available_agents}` placeholder.
+        subagents: 包含 name、description 和 runnable 的子代理规格列表。
+        task_description: task 工具的自定义描述。为 None 时使用默认模板，
+            支持 {available_agents} 占位符。
 
     Returns:
-        A StructuredTool that can invoke subagents by type.
+        可按类型调用子代理的 StructuredTool。
     """
     # Build the graphs dict and descriptions from the unified spec list
     subagent_graphs: dict[str, Runnable] = {spec["name"]: spec["runnable"] for spec in subagents}
@@ -674,7 +649,7 @@ class SubAgentMiddleware(AgentMiddleware[Any, ContextT, ResponseT]):
         request: ModelRequest[ContextT],
         handler: Callable[[ModelRequest[ContextT]], ModelResponse[ResponseT]],
     ) -> ModelResponse[ResponseT]:
-        """Update the system message to include instructions on using subagents."""
+        """将子代理使用说明注入系统消息（同步版本）。"""
         if self.system_prompt is not None:
             new_system_message = append_to_system_message(request.system_message, self.system_prompt)
             return handler(request.override(system_message=new_system_message))
@@ -685,7 +660,7 @@ class SubAgentMiddleware(AgentMiddleware[Any, ContextT, ResponseT]):
         request: ModelRequest[ContextT],
         handler: Callable[[ModelRequest[ContextT]], Awaitable[ModelResponse[ResponseT]]],
     ) -> ModelResponse[ResponseT]:
-        """(async) Update the system message to include instructions on using subagents."""
+        """将子代理使用说明注入系统消息（异步版本）。"""
         if self.system_prompt is not None:
             new_system_message = append_to_system_message(request.system_message, self.system_prompt)
             return await handler(request.override(system_message=new_system_message))

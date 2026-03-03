@@ -1,7 +1,7 @@
-"""Skills middleware for loading and exposing agent skills to the system prompt.
+"""技能中间件，用于加载并向系统提示暴露 Agent 技能。
 
-This module implements Anthropic's agent skills pattern with progressive disclosure,
-loading skills from backend storage via configurable sources.
+本模块实现了 Anthropic 的 Agent 技能模式（渐进式披露），
+从后端存储通过可配置的来源加载技能。
 
 ## Architecture
 
@@ -122,112 +122,102 @@ from deepagents.middleware._utils import append_to_system_message
 
 logger = logging.getLogger(__name__)
 
-# Security: Maximum size for SKILL.md files to prevent DoS attacks (10MB)
+# 安全限制：SKILL.md 文件最大尺寸，防止 DoS 攻击（10MB）
 MAX_SKILL_FILE_SIZE = 10 * 1024 * 1024
 
-# Agent Skills specification constraints (https://agentskills.io/specification)
-MAX_SKILL_NAME_LENGTH = 64
-MAX_SKILL_DESCRIPTION_LENGTH = 1024
-MAX_SKILL_COMPATIBILITY_LENGTH = 500
+# Agent Skills 规范约束（https://agentskills.io/specification）
+MAX_SKILL_NAME_LENGTH = 64          # 技能名称最大长度
+MAX_SKILL_DESCRIPTION_LENGTH = 1024  # 技能描述最大长度
+MAX_SKILL_COMPATIBILITY_LENGTH = 500 # 兼容性字段最大长度
 
 
 class SkillMetadata(TypedDict):
-    """Metadata for a skill per Agent Skills specification (https://agentskills.io/specification)."""
+    """技能元数据，遵循 Agent Skills 规范（https://agentskills.io/specification）。"""
 
     path: str
-    """Path to the SKILL.md file."""
+    """SKILL.md 文件的路径。"""
 
     name: str
-    """Skill identifier.
+    """技能标识符。
 
-    Constraints per Agent Skills specification:
-
-    - 1-64 characters
-    - Unicode lowercase alphanumeric and hyphens only (`a-z` and `-`).
-    - Must not start or end with `-`
-    - Must not contain consecutive `--`
-    - Must match the parent directory name containing the `SKILL.md` file
+    Agent Skills 规范约束：
+    - 1-64 个字符
+    - 仅允许 Unicode 小写字母、数字和连字符（a-z 和 -）
+    - 不能以 - 开头或结尾
+    - 不能包含连续的 --
+    - 必须与包含 SKILL.md 文件的父目录名称一致
     """
 
     description: str
-    """What the skill does.
+    """技能的功能描述。
 
-    Constraints per Agent Skills specification:
-
-    - 1-1024 characters
-    - Should describe both what the skill does and when to use it
-    - Should include specific keywords that help agents identify relevant tasks
+    Agent Skills 规范约束：
+    - 1-1024 个字符
+    - 应同时描述技能的功能和使用时机
+    - 应包含帮助 Agent 识别相关任务的关键词
     """
 
     license: str | None
-    """License name or reference to bundled license file."""
+    """许可证名称或对捆绑许可证文件的引用。"""
 
     compatibility: str | None
-    """Environment requirements.
+    """环境要求说明。
 
-    Constraints per Agent Skills specification:
-
-    - 1-500 characters if provided
-    - Should only be included if there are specific compatibility requirements
-    - Can indicate intended product, required packages, etc.
+    Agent Skills 规范约束：
+    - 若提供，长度为 1-500 个字符
+    - 仅在有特定兼容性要求时才包含
+    - 可指明目标产品、所需包等
     """
 
     metadata: dict[str, str]
-    """Arbitrary key-value mapping for additional metadata.
+    """附加元数据的任意键值映射。
 
-    Clients can use this to store additional properties not defined by the spec.
-
-    It is recommended to keep key names unique to avoid conflicts.
+    客户端可用此字段存储规范未定义的额外属性。
+    建议保持键名唯一以避免冲突。
     """
 
     allowed_tools: list[str]
-    """Tool names the skill recommends using.
+    """技能推荐使用的工具名称列表。
 
-    Warning: this is experimental.
-
-    Constraints per Agent Skills specification:
-
-    - Space-delimited list of tool names
+    警告：此字段为实验性功能。
+    Agent Skills 规范约束：以空格分隔的工具名称列表。
     """
 
 
 class SkillsState(AgentState):
-    """State for the skills middleware."""
+    """技能中间件的状态模式。"""
 
+    # 私有字段：存储已加载的技能元数据列表，不会传播到父 Agent
     skills_metadata: NotRequired[Annotated[list[SkillMetadata], PrivateStateAttr]]
-    """List of loaded skill metadata from configured sources. Not propagated to parent agents."""
+    """从配置来源加载的技能元数据列表，不会传播到父 Agent。"""
 
 
 class SkillsStateUpdate(TypedDict):
-    """State update for the skills middleware."""
+    """技能中间件的状态更新结构。"""
 
     skills_metadata: list[SkillMetadata]
-    """List of loaded skill metadata to merge into state."""
+    """待合并到状态中的技能元数据列表。"""
 
 
 def _validate_skill_name(name: str, directory_name: str) -> tuple[bool, str]:
-    """Validate skill name per Agent Skills specification.
+    """按 Agent Skills 规范校验技能名称。
 
-    Constraints per Agent Skills specification:
+    规范约束：
+    - 1-64 个字符
+    - 仅允许 Unicode 小写字母、数字和连字符（a-z 和 -）
+    - 不能以 - 开头或结尾
+    - 不能包含连续的 --
+    - 必须与包含 SKILL.md 文件的父目录名称一致
 
-    - 1-64 characters
-    - Unicode lowercase alphanumeric and hyphens only (`a-z` and `-`).
-    - Must not start or end with `-`
-    - Must not contain consecutive `--`
-    - Must match the parent directory name containing the `SKILL.md` file
-
-    Unicode lowercase alphanumeric means any character where `c.isalpha() and
-    c.islower()` or `c.isdigit()` returns `True`, which covers accented Latin
-    characters (e.g., `'café'`, `'über-tool'`) and other scripts.
+    Unicode 小写字母数字指满足 `c.isalpha() and c.islower()` 或 `c.isdigit()` 的字符，
+    涵盖带重音的拉丁字符（如 'café'、'über-tool'）及其他文字。
 
     Args:
-        name: Skill name from YAML frontmatter
-        directory_name: Parent directory name
+        name: YAML frontmatter 中的技能名称。
+        directory_name: 包含 SKILL.md 的父目录名称。
 
     Returns:
-        `(is_valid, error_message)` tuple.
-
-            Error message is empty if valid.
+        `(is_valid, error_message)` 元组，校验通过时 error_message 为空字符串。
     """
     if not name:
         return False, "name is required"
@@ -251,19 +241,17 @@ def _parse_skill_metadata(  # noqa: C901
     skill_path: str,
     directory_name: str,
 ) -> SkillMetadata | None:
-    """Parse YAML frontmatter from `SKILL.md` content.
+    """从 SKILL.md 内容中解析 YAML frontmatter 元数据。
 
-    Extracts metadata per Agent Skills specification from YAML frontmatter
-    delimited by `---` markers at the start of the content.
+    按 Agent Skills 规范从文件开头的 `---` 分隔符之间提取 YAML frontmatter。
 
     Args:
-        content: Content of the `SKILL.md` file
-        skill_path: Path to the `SKILL.md` file (for error messages and metadata)
-        directory_name: Name of the parent directory containing the skill
+        content: SKILL.md 文件的完整内容。
+        skill_path: SKILL.md 文件路径（用于错误信息和元数据）。
+        directory_name: 包含该技能的父目录名称。
 
     Returns:
-        `SkillMetadata` if parsing succeeds, `None` if parsing fails or
-            validation errors occur
+        解析成功返回 SkillMetadata，解析失败或校验不通过返回 None。
     """
     if len(content) > MAX_SKILL_FILE_SIZE:
         logger.warning("Skipping %s: content too large (%d bytes)", skill_path, len(content))
@@ -355,18 +343,18 @@ def _validate_metadata(
     raw: object,
     skill_path: str,
 ) -> dict[str, str]:
-    """Validate and normalize the metadata field from YAML frontmatter.
+    """校验并规范化 YAML frontmatter 中的 metadata 字段。
 
-    YAML `safe_load` can return any type for the `metadata` key. This
-    ensures the values in `SkillMetadata` are always a `dict[str, str]` by
-    coercing via `str()` and rejecting non-dict inputs.
+    YAML safe_load 对 metadata 键可能返回任意类型。
+    本函数通过 str() 强制转换并拒绝非字典输入，
+    确保 SkillMetadata 中的值始终为 dict[str, str]。
 
     Args:
-        raw: Raw value from `frontmatter_data.get("metadata", {})`.
-        skill_path: Path to the `SKILL.md` file (for warning messages).
+        raw: frontmatter_data.get("metadata", {}) 的原始值。
+        skill_path: SKILL.md 文件路径（用于警告信息）。
 
     Returns:
-        A validated `dict[str, str]`.
+        校验后的 dict[str, str]。
     """
     if not isinstance(raw, dict):
         if raw:
@@ -380,17 +368,17 @@ def _validate_metadata(
 
 
 def _format_skill_annotations(skill: SkillMetadata) -> str:
-    """Build a parenthetical annotation string from optional skill fields.
+    """从技能的可选字段构建括号注释字符串。
 
-    Combines license and compatibility into a comma-separated string for
-    display in the system prompt skill listing.
+    将 license 和 compatibility 合并为逗号分隔的字符串，
+    用于在系统提示的技能列表中显示。
 
     Args:
-        skill: Skill metadata to extract annotations from.
+        skill: 待提取注释的技能元数据。
 
     Returns:
-        Annotation string like `'License: MIT, Compatibility: Python 3.10+'`,
-            or empty string if neither field is set.
+        形如 'License: MIT, Compatibility: Python 3.10+' 的注释字符串，
+        若两个字段均未设置则返回空字符串。
     """
     parts: list[str] = []
     if skill.get("license"):
@@ -401,26 +389,25 @@ def _format_skill_annotations(skill: SkillMetadata) -> str:
 
 
 def _list_skills(backend: BackendProtocol, source_path: str) -> list[SkillMetadata]:
-    """List all skills from a backend source.
+    """从后端来源列出所有技能（同步版本）。
 
-    Scans backend for subdirectories containing `SKILL.md` files, downloads
-    their content, parses YAML frontmatter, and returns skill metadata.
+    扫描后端中包含 SKILL.md 文件的子目录，下载内容，
+    解析 YAML frontmatter，并返回技能元数据列表。
 
-    Expected structure:
-
+    预期目录结构：
     ```txt
     source_path/
     └── skill-name/
-        ├── SKILL.md   # Required
-        └── helper.py  # Optional
+        ├── SKILL.md   # 必须
+        └── helper.py  # 可选
     ```
 
     Args:
-        backend: Backend instance to use for file operations
-        source_path: Path to the skills directory in the backend
+        backend: 用于文件操作的后端实例。
+        source_path: 后端中技能目录的路径。
 
     Returns:
-        List of skill metadata from successfully parsed `SKILL.md` files
+        成功解析的 SKILL.md 文件对应的技能元数据列表。
     """
     skills: list[SkillMetadata] = []
     items = backend.ls_info(source_path)
@@ -478,26 +465,25 @@ def _list_skills(backend: BackendProtocol, source_path: str) -> list[SkillMetada
 
 
 async def _alist_skills(backend: BackendProtocol, source_path: str) -> list[SkillMetadata]:
-    """List all skills from a backend source (async version).
+    """从后端来源列出所有技能（异步版本）。
 
-    Scans backend for subdirectories containing `SKILL.md` files, downloads
-    their content, parses YAML frontmatter, and returns skill metadata.
+    扫描后端中包含 SKILL.md 文件的子目录，异步下载内容，
+    解析 YAML frontmatter，并返回技能元数据列表。
 
-    Expected structure:
-
+    预期目录结构：
     ```txt
     source_path/
     └── skill-name/
-        ├── SKILL.md   # Required
-        └── helper.py  # Optional
+        ├── SKILL.md   # 必须
+        └── helper.py  # 可选
     ```
 
     Args:
-        backend: Backend instance to use for file operations
-        source_path: Path to the skills directory in the backend
+        backend: 用于文件操作的后端实例。
+        source_path: 后端中技能目录的路径。
 
     Returns:
-        List of skill metadata from successfully parsed `SKILL.md` files
+        成功解析的 SKILL.md 文件对应的技能元数据列表。
     """
     skills: list[SkillMetadata] = []
     items = await backend.als_info(source_path)
@@ -644,15 +630,18 @@ class SkillsMiddleware(AgentMiddleware[SkillsState, ContextT, ResponseT]):
         self.system_prompt_template = SKILLS_SYSTEM_PROMPT
 
     def _get_backend(self, state: SkillsState, runtime: Runtime, config: RunnableConfig) -> BackendProtocol:
-        """Resolve backend from instance or factory.
+        """从实例或工厂函数解析后端。
+
+        若 _backend 是可调用对象，则构造临时 ToolRuntime 调用工厂函数；
+        否则直接返回后端实例。
 
         Args:
-            state: Current agent state.
-            runtime: Runtime context for factory functions.
-            config: Runnable config to pass to backend factory.
+            state: 当前 Agent 状态。
+            runtime: 工厂函数所需的运行时上下文。
+            config: 传递给后端工厂的可运行配置。
 
         Returns:
-            Resolved backend instance
+            解析后的后端实例。
         """
         if callable(self._backend):
             # Construct an artificial tool runtime to resolve backend factory
@@ -673,7 +662,7 @@ class SkillsMiddleware(AgentMiddleware[SkillsState, ContextT, ResponseT]):
         return self._backend
 
     def _format_skills_locations(self) -> str:
-        """Format skills locations for display in system prompt."""
+        """格式化技能来源路径，用于在系统提示中显示。"""
         locations = []
 
         for i, source_path in enumerate(self.sources):
@@ -684,7 +673,7 @@ class SkillsMiddleware(AgentMiddleware[SkillsState, ContextT, ResponseT]):
         return "\n".join(locations)
 
     def _format_skills_list(self, skills: list[SkillMetadata]) -> str:
-        """Format skills metadata for display in system prompt."""
+        """格式化技能元数据列表，用于在系统提示中显示。"""
         if not skills:
             paths = [f"{source_path}" for source_path in self.sources]
             return f"(No skills available yet. You can create skills in {' or '.join(paths)})"
@@ -703,13 +692,13 @@ class SkillsMiddleware(AgentMiddleware[SkillsState, ContextT, ResponseT]):
         return "\n".join(lines)
 
     def modify_request(self, request: ModelRequest[ContextT]) -> ModelRequest[ContextT]:
-        """Inject skills documentation into a model request's system message.
+        """将技能文档注入模型请求的系统消息。
 
         Args:
-            request: Model request to modify
+            request: 待修改的模型请求。
 
         Returns:
-            New model request with skills documentation injected into system message
+            注入了技能文档的新模型请求。
         """
         skills_metadata = request.state.get("skills_metadata", [])
         skills_locations = self._format_skills_locations()
@@ -725,22 +714,20 @@ class SkillsMiddleware(AgentMiddleware[SkillsState, ContextT, ResponseT]):
         return request.override(system_message=new_system_message)
 
     def before_agent(self, state: SkillsState, runtime: Runtime, config: RunnableConfig) -> SkillsStateUpdate | None:  # ty: ignore[invalid-method-override]
-        """Load skills metadata before agent execution (synchronous).
+        """在 Agent 执行前同步加载技能元数据。
 
-        Loads skills once per session from all configured sources. If
-        `skills_metadata` is already present in state (from a prior turn or
-        checkpointed session), the load is skipped and `None` is returned.
+        每次会话只加载一次。若状态中已存在 skills_metadata（来自上一轮或检查点），
+        则跳过加载并返回 None。
 
-        Skills are loaded in source order with later sources overriding
-        earlier ones if they contain skills with the same name (last one wins).
+        按来源顺序加载，同名技能后来源覆盖前来源（后者优先）。
 
         Args:
-            state: Current agent state.
-            runtime: Runtime context.
-            config: Runnable config.
+            state: 当前 Agent 状态。
+            runtime: 运行时上下文。
+            config: 可运行配置。
 
         Returns:
-            State update with `skills_metadata` populated, or `None` if already present.
+            包含已填充 skills_metadata 的状态更新，若已存在则返回 None。
         """
         # Skip if skills_metadata is already present in state (even if empty)
         if "skills_metadata" in state:
@@ -761,22 +748,20 @@ class SkillsMiddleware(AgentMiddleware[SkillsState, ContextT, ResponseT]):
         return SkillsStateUpdate(skills_metadata=skills)
 
     async def abefore_agent(self, state: SkillsState, runtime: Runtime, config: RunnableConfig) -> SkillsStateUpdate | None:  # ty: ignore[invalid-method-override]
-        """Load skills metadata before agent execution (async).
+        """在 Agent 执行前异步加载技能元数据。
 
-        Loads skills once per session from all configured sources. If
-        `skills_metadata` is already present in state (from a prior turn or
-        checkpointed session), the load is skipped and `None` is returned.
+        每次会话只加载一次。若状态中已存在 skills_metadata（来自上一轮或检查点），
+        则跳过加载并返回 None。
 
-        Skills are loaded in source order with later sources overriding
-        earlier ones if they contain skills with the same name (last one wins).
+        按来源顺序加载，同名技能后来源覆盖前来源（后者优先）。
 
         Args:
-            state: Current agent state.
-            runtime: Runtime context.
-            config: Runnable config.
+            state: 当前 Agent 状态。
+            runtime: 运行时上下文。
+            config: 可运行配置。
 
         Returns:
-            State update with `skills_metadata` populated, or `None` if already present.
+            包含已填充 skills_metadata 的状态更新，若已存在则返回 None。
         """
         # Skip if skills_metadata is already present in state (even if empty)
         if "skills_metadata" in state:
@@ -801,14 +786,14 @@ class SkillsMiddleware(AgentMiddleware[SkillsState, ContextT, ResponseT]):
         request: ModelRequest[ContextT],
         handler: Callable[[ModelRequest[ContextT]], ModelResponse[ResponseT]],
     ) -> ModelResponse[ResponseT]:
-        """Inject skills documentation into the system prompt.
+        """将技能文档注入系统提示（同步版本）。
 
         Args:
-            request: Model request being processed
-            handler: Handler function to call with modified request
+            request: 正在处理的模型请求。
+            handler: 使用修改后请求调用的处理函数。
 
         Returns:
-            Model response from handler
+            处理函数返回的模型响应。
         """
         modified_request = self.modify_request(request)
         return handler(modified_request)
@@ -818,14 +803,14 @@ class SkillsMiddleware(AgentMiddleware[SkillsState, ContextT, ResponseT]):
         request: ModelRequest[ContextT],
         handler: Callable[[ModelRequest[ContextT]], Awaitable[ModelResponse[ResponseT]]],
     ) -> ModelResponse[ResponseT]:
-        """Inject skills documentation into the system prompt (async version).
+        """将技能文档注入系统提示（异步版本）。
 
         Args:
-            request: Model request being processed
-            handler: Async handler function to call with modified request
+            request: 正在处理的模型请求。
+            handler: 使用修改后请求调用的异步处理函数。
 
         Returns:
-            Model response from handler
+            处理函数返回的模型响应。
         """
         modified_request = self.modify_request(request)
         return await handler(modified_request)

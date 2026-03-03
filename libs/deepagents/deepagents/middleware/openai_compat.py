@@ -1,4 +1,4 @@
-"""Middleware for OpenAI API compatibility with older versions that only support string content."""
+"""OpenAI API 兼容性中间件，用于兼容仅支持字符串内容的旧版 API。"""
 
 from __future__ import annotations
 
@@ -22,58 +22,67 @@ if TYPE_CHECKING:
 
 
 def _flatten_content_to_string(content: Any) -> str:
-    """Convert content blocks to a single string for older OpenAI APIs.
-    
+    """将内容块列表转换为单一字符串，用于兼容旧版 OpenAI API。
+
+    旧版 OpenAI API 要求消息的 content 字段为字符串，而新版 API 支持内容块数组。
+    本函数将各种格式的内容统一转换为字符串。
+
     Args:
-        content: The content to flatten (can be string or list of blocks)
-        
+        content: 待转换的内容，可以是字符串或内容块列表。
+
     Returns:
-        A single string representation of the content
+        内容的单一字符串表示。
     """
+    # 若已是字符串，直接返回
     if isinstance(content, str):
         return content
-    
+
     if isinstance(content, list):
         parts = []
         for block in content:
             if isinstance(block, str):
+                # 字符串块直接追加
                 parts.append(block)
             elif isinstance(block, dict):
                 if block.get("type") == "text":
+                    # 文本块：提取 text 字段
                     parts.append(block.get("text", ""))
                 elif block.get("type") == "image_url":
+                    # 图片块：用占位符替代
                     parts.append("[Image]")
                 elif block.get("type") == "file":
+                    # 文件块：用占位符替代
                     parts.append("[File]")
                 else:
-                    # For other block types, try to extract text
+                    # 其他类型块：尝试提取 text 字段
                     if "text" in block:
                         parts.append(block["text"])
+        # 过滤空字符串后用换行符拼接
         return "\n".join(filter(None, parts))
-    
+
+    # 其他类型直接转为字符串
     return str(content)
 
 
 class OpenAICompatMiddleware(AgentMiddleware):
-    """Middleware for compatibility with older OpenAI API versions.
-    
-    This middleware converts message content from array format (used by newer OpenAI APIs)
-    to string format (required by older OpenAI APIs that don't support content arrays).
-    
-    This is useful when using OpenAI-compatible APIs that follow the older protocol
-    specification where the `content` field must be a string, not an array.
-    
-    Example:
+    """兼容旧版 OpenAI API 的中间件。
+
+    将消息内容从数组格式（新版 OpenAI API 使用）转换为字符串格式
+    （旧版 OpenAI API 要求 content 字段必须为字符串，不支持数组）。
+
+    适用于使用旧版协议规范的 OpenAI 兼容 API。
+
+    示例：
         ```python
         from deepagents import create_deep_agent
         from deepagents.middleware.openai_compat import OpenAICompatMiddleware
         from langchain_openai import ChatOpenAI
-        
+
         model = ChatOpenAI(
             model="deepseek-ai/DeepSeek-V3",
             base_url="https://api.example.com/v1",
         )
-        
+
         agent = create_deep_agent(
             model=model,
             middleware=[OpenAICompatMiddleware()]
@@ -86,25 +95,27 @@ class OpenAICompatMiddleware(AgentMiddleware):
         request: ModelRequest,
         handler: Callable[[ModelRequest], ModelResponse],
     ) -> ModelCallResult:
-        """Convert message content to string format for older OpenAI APIs.
-        
+        """将消息内容转换为字符串格式，以兼容旧版 OpenAI API（同步版本）。
+
+        若系统消息的 content 为列表（内容块数组），则将其展平为字符串。
+
         Args:
-            request: Model request to execute
-            handler: Callback that executes the model request
-            
+            request: 待执行的模型请求。
+            handler: 执行模型请求的回调函数。
+
         Returns:
-            The model call result
+            模型调用结果。
         """
-        # Convert system message if needed
+        # 若存在系统消息且其内容为列表格式，则转换为字符串
         if request.system_message is not None:
             system_content = request.system_message.content
             if isinstance(system_content, list):
-                # Flatten content blocks to string
+                # 将内容块数组展平为字符串
                 flattened = _flatten_content_to_string(system_content)
                 request = request.override(
                     system_message=SystemMessage(content=flattened)
                 )
-        
+
         return handler(request)
 
     async def awrap_model_call(
@@ -112,23 +123,23 @@ class OpenAICompatMiddleware(AgentMiddleware):
         request: ModelRequest,
         handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
     ) -> ModelCallResult:
-        """Async version of wrap_model_call.
-        
+        """将消息内容转换为字符串格式，以兼容旧版 OpenAI API（异步版本）。
+
         Args:
-            request: Model request to execute
-            handler: Async callback that executes the model request
-            
+            request: 待执行的模型请求。
+            handler: 异步执行模型请求的回调函数。
+
         Returns:
-            The model call result
+            模型调用结果。
         """
-        # Convert system message if needed
+        # 若存在系统消息且其内容为列表格式，则转换为字符串
         if request.system_message is not None:
             system_content = request.system_message.content
             if isinstance(system_content, list):
-                # Flatten content blocks to string
+                # 将内容块数组展平为字符串
                 flattened = _flatten_content_to_string(system_content)
                 request = request.override(
                     system_message=SystemMessage(content=flattened)
                 )
-        
+
         return await handler(request)

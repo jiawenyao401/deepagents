@@ -1,4 +1,16 @@
-"""Middleware for providing filesystem tools to an agent."""
+"""为 Agent 提供文件系统工具的中间件。
+
+本模块实现了 FilesystemMiddleware，向 Agent 注入以下工具：
+- ls：列出目录内容
+- read_file：读取文件（支持分页、图片）
+- write_file：写入新文件
+- edit_file：精确字符串替换编辑文件
+- glob：按模式匹配文件
+- grep：在文件中搜索文本
+- execute：在沙箱中执行 shell 命令（需后端支持）
+
+同时支持大型工具结果自动卸载到文件系统，防止上下文窗口溢出。
+"""
 # ruff: noqa: E501
 
 import asyncio
@@ -43,12 +55,19 @@ from deepagents.backends.utils import (
 )
 from deepagents.middleware._utils import append_to_system_message
 
+# 文件内容为空时的系统提示
 EMPTY_CONTENT_WARNING = "System reminder: File exists but has empty contents"
+# glob 工具的超时时间（秒）
 GLOB_TIMEOUT = 20.0  # seconds
+# 行号显示宽度
 LINE_NUMBER_WIDTH = 6
+# read_file 默认起始行偏移
 DEFAULT_READ_OFFSET = 0
+# read_file 默认最大读取行数
 DEFAULT_READ_LIMIT = 100
+# 支持作为图片读取的文件扩展名集合
 IMAGE_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp"})
+# 图片扩展名到 MIME 类型的映射
 IMAGE_MEDIA_TYPES = {
     ".png": "image/png",
     ".jpg": "image/jpeg",
@@ -58,8 +77,8 @@ IMAGE_MEDIA_TYPES = {
 }
 
 
-# Template for truncation message in read_file
-# {file_path} will be filled in at runtime
+# read_file 工具结果超出 token 限制时的截断提示模板
+# {file_path} 在运行时填充为实际文件路径
 READ_FILE_TRUNCATION_MSG = (
     "\n\n[Output was truncated due to size limits. "
     "The file content is very large. "
@@ -68,47 +87,45 @@ READ_FILE_TRUNCATION_MSG = (
     "For other formats, you can use appropriate formatting tools to split long lines.]"
 )
 
-# Approximate number of characters per token for truncation calculations.
-# Using 4 chars per token as a conservative approximation (actual ratio varies by content)
-# This errs on the high side to avoid premature eviction of content that might fit
+# 每个 token 对应的近似字符数，用于截断计算。
+# 使用 4 字符/token 作为保守估算（实际比例因内容而异）。
+# 偏高估算可避免过早卸载仍能放入上下文的内容。
 NUM_CHARS_PER_TOKEN = 4
 
 
 class FileData(TypedDict):
-    """Data structure for storing file contents with metadata."""
+    """存储文件内容及元数据的数据结构。"""
 
     content: list[str]
-    """Lines of the file."""
+    """文件的各行内容列表。"""
 
     created_at: str
-    """ISO 8601 timestamp of file creation."""
+    """文件创建时间（ISO 8601 格式）。"""
 
     modified_at: str
-    """ISO 8601 timestamp of last modification."""
+    """文件最后修改时间（ISO 8601 格式）。"""
 
 
 def _file_data_reducer(left: dict[str, FileData] | None, right: dict[str, FileData | None]) -> dict[str, FileData]:
-    """Merge file updates with support for deletions.
+    """合并文件更新，支持删除操作。
 
-    This reducer enables file deletion by treating `None` values in the right
-    dictionary as deletion markers. It's designed to work with LangGraph's
-    state management where annotated reducers control how state updates merge.
+    本 reducer 将 right 字典中值为 None 的键视为删除标记，
+    配合 LangGraph 的状态管理使用（通过注解 reducer 控制状态合并方式）。
 
     Args:
-        left: Existing files dictionary. May be `None` during initialization.
-        right: New files dictionary to merge. Files with `None` values are
-            treated as deletion markers and removed from the result.
+        left: 已有的文件字典，初始化时可能为 None。
+        right: 待合并的新文件字典。值为 None 的键表示删除该文件。
 
     Returns:
-        Merged dictionary where right overwrites left for matching keys,
-        and `None` values in right trigger deletions.
+        合并后的字典：right 中的非 None 值覆盖 left 中的同名键，
+        right 中值为 None 的键从结果中删除。
 
-    Example:
+    示例：
         ```python
         existing = {"/file1.txt": FileData(...), "/file2.txt": FileData(...)}
         updates = {"/file2.txt": None, "/file3.txt": FileData(...)}
         result = file_data_reducer(existing, updates)
-        # Result: {"/file1.txt": FileData(...), "/file3.txt": FileData(...)}
+        # 结果: {"/file1.txt": FileData(...), "/file3.txt": FileData(...)}
         ```
     """
     if left is None:
@@ -124,10 +141,11 @@ def _file_data_reducer(left: dict[str, FileData] | None, right: dict[str, FileDa
 
 
 class FilesystemState(AgentState):
-    """State for the filesystem middleware."""
+    """文件系统中间件的状态模式。"""
 
+    # 使用自定义 reducer 管理文件字典，支持增删改操作
     files: Annotated[NotRequired[dict[str, FileData]], _file_data_reducer]
-    """Files in the filesystem."""
+    """文件系统中的文件字典（路径 -> FileData）。"""
 
 
 LIST_FILES_TOOL_DESCRIPTION = """Lists all files in a directory.
@@ -271,16 +289,16 @@ Use this tool to run commands, scripts, tests, builds, and other shell operation
 
 
 def _supports_execution(backend: BackendProtocol) -> bool:
-    """Check if a backend supports command execution.
+    """检查后端是否支持命令执行。
 
-    For CompositeBackend, checks if the default backend supports execution.
-    For other backends, checks if they implement SandboxBackendProtocol.
+    对于 CompositeBackend，检查其默认后端是否支持执行。
+    对于其他后端，检查是否实现了 SandboxBackendProtocol。
 
     Args:
-        backend: The backend to check.
+        backend: 待检查的后端实例。
 
     Returns:
-        True if the backend supports execution, False otherwise.
+        若后端支持执行则返回 True，否则返回 False。
     """
     # For CompositeBackend, check the default backend
     if isinstance(backend, CompositeBackend):
@@ -290,27 +308,21 @@ def _supports_execution(backend: BackendProtocol) -> bool:
     return isinstance(backend, SandboxBackendProtocol)
 
 
-# Tools that should be excluded from the large result eviction logic.
+# 不参与大结果卸载逻辑的工具列表。
 #
-# This tuple contains tools that should NOT have their results evicted to the filesystem
-# when they exceed token limits. Tools are excluded for different reasons:
+# 以下工具的结果不会在超出 token 限制时被卸载到文件系统，原因各异：
 #
-# 1. Tools with built-in truncation (ls, glob, grep):
-#    These tools truncate their own output when it becomes too large. When these tools
-#    produce truncated output due to many matches, it typically indicates the query
-#    needs refinement rather than full result preservation. In such cases, the truncated
-#    matches are potentially more like noise and the LLM should be prompted to narrow
-#    its search criteria instead.
+# 1. 自带截断逻辑的工具（ls、glob、grep）：
+#    这些工具在输出过大时会自行截断。截断输出通常意味着查询需要细化，
+#    而非保留全部结果。此时应提示 LLM 缩小搜索范围。
 #
-# 2. Tools with problematic truncation behavior (read_file):
-#    read_file is tricky to handle as the failure mode here is single long lines
-#    (e.g., imagine a jsonl file with very long payloads on each line). If we try to
-#    truncate the result of read_file, the agent may then attempt to re-read the
-#    truncated file using read_file again, which won't help.
+# 2. 截断行为有问题的工具（read_file）：
+#    read_file 的失败场景是单行内容极长（如 jsonl 文件中每行都是大 payload）。
+#    若截断 read_file 的结果，Agent 可能会再次调用 read_file 读取截断后的文件，
+#    这样做没有意义。
 #
-# 3. Tools that never exceed limits (edit_file, write_file):
-#    These tools return minimal confirmation messages and are never expected to produce
-#    output large enough to exceed token limits, so checking them would be unnecessary.
+# 3. 结果永远不会超限的工具（edit_file、write_file）：
+#    这些工具只返回简短的确认消息，不会产生超出 token 限制的输出。
 TOOLS_EXCLUDED_FROM_EVICTION = (
     "ls",
     "glob",
@@ -334,15 +346,17 @@ Here is a preview showing the head and tail of the result (lines of the form `..
 
 
 def _create_content_preview(content_str: str, *, head_lines: int = 5, tail_lines: int = 5) -> str:
-    """Create a preview of content showing head and tail with truncation marker.
+    """创建内容预览，显示头部和尾部行，中间用截断标记省略。
+
+    用于大型工具结果卸载时，生成供 LLM 参考的内容摘要。
 
     Args:
-        content_str: The full content string to preview.
-        head_lines: Number of lines to show from the start.
-        tail_lines: Number of lines to show from the end.
+        content_str: 待预览的完整内容字符串。
+        head_lines: 从开头显示的行数。
+        tail_lines: 从末尾显示的行数。
 
     Returns:
-        Formatted preview string with line numbers.
+        带行号的格式化预览字符串。
     """
     lines = content_str.splitlines()
 
@@ -464,13 +478,16 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
         ]
 
     def _get_backend(self, runtime: ToolRuntime[Any, Any]) -> BackendProtocol:
-        """Get the resolved backend instance from backend or factory.
+        """从后端实例或工厂函数解析后端。
+
+        若 backend 是可调用对象（工厂函数），则调用它获取后端实例；
+        否则直接返回后端实例。
 
         Args:
-            runtime: The tool runtime context.
+            runtime: 工具运行时上下文。
 
         Returns:
-            Resolved backend instance.
+            解析后的后端实例。
         """
         if callable(self.backend):
             return self.backend(runtime)  # ty: ignore[call-top-callable]
@@ -995,14 +1012,17 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
         request: ModelRequest[ContextT],
         handler: Callable[[ModelRequest[ContextT]], ModelResponse[ResponseT]],
     ) -> ModelResponse[ResponseT]:
-        """Update the system prompt and filter tools based on backend capabilities.
+        """根据后端能力更新系统提示并过滤工具列表（同步版本）。
+
+        若后端不支持执行，则从工具列表中移除 execute 工具。
+        根据可用工具动态构建系统提示（或使用自定义提示）。
 
         Args:
-            request: The model request being processed.
-            handler: The handler function to call with the modified request.
+            request: 正在处理的模型请求。
+            handler: 使用修改后请求调用的处理函数。
 
         Returns:
-            The model response from the handler.
+            处理函数返回的模型响应。
         """
         # Check if execute tool is present and if backend supports it
         has_execute_tool = any((tool.name if hasattr(tool, "name") else tool.get("name")) == "execute" for tool in request.tools)
@@ -1043,14 +1063,14 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
         request: ModelRequest[ContextT],
         handler: Callable[[ModelRequest[ContextT]], Awaitable[ModelResponse[ResponseT]]],
     ) -> ModelResponse[ResponseT]:
-        """(async) Update the system prompt and filter tools based on backend capabilities.
+        """根据后端能力更新系统提示并过滤工具列表（异步版本）。
 
         Args:
-            request: The model request being processed.
-            handler: The handler function to call with the modified request.
+            request: 正在处理的模型请求。
+            handler: 使用修改后请求调用的异步处理函数。
 
         Returns:
-            The model response from the handler.
+            处理函数返回的模型响应。
         """
         # Check if execute tool is present and if backend supports it
         has_execute_tool = any((tool.name if hasattr(tool, "name") else tool.get("name")) == "execute" for tool in request.tools)
@@ -1091,7 +1111,7 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
         message: ToolMessage,
         resolved_backend: BackendProtocol,
     ) -> tuple[ToolMessage, dict[str, FileData] | None]:
-        """Process a large ToolMessage by evicting its content to filesystem.
+        """将大型 ToolMessage 的内容卸载到文件系统（同步版本）。
 
         Args:
             message: The ToolMessage with large content to evict.
@@ -1168,10 +1188,10 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
         message: ToolMessage,
         resolved_backend: BackendProtocol,
     ) -> tuple[ToolMessage, dict[str, FileData] | None]:
-        """Async version of _process_large_message.
+        """将大型 ToolMessage 的内容卸载到文件系统（异步版本）。
 
-        Uses async backend methods to avoid sync calls in async context.
-        See _process_large_message for full documentation.
+        使用异步后端方法，避免在异步上下文中调用同步方法。
+        详细文档参见 _process_large_message。
         """
         # Early exit if eviction not configured
         if not self._tool_token_limit_before_evict:
@@ -1225,7 +1245,7 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
         return processed_message, result.files_update
 
     def _intercept_large_tool_result(self, tool_result: ToolMessage | Command, runtime: ToolRuntime) -> ToolMessage | Command:
-        """Intercept and process large tool results before they're added to state.
+        """在工具结果加入状态前拦截并处理大型结果（同步版本）。
 
         Args:
             tool_result: The tool result to potentially evict (ToolMessage or Command).
@@ -1282,10 +1302,10 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
         raise AssertionError(msg)
 
     async def _aintercept_large_tool_result(self, tool_result: ToolMessage | Command, runtime: ToolRuntime) -> ToolMessage | Command:
-        """Async version of _intercept_large_tool_result.
+        """在工具结果加入状态前拦截并处理大型结果（异步版本）。
 
-        Uses async backend methods to avoid sync calls in async context.
-        See _intercept_large_tool_result for full documentation.
+        使用异步后端方法，避免在异步上下文中调用同步方法。
+        详细文档参见 _intercept_large_tool_result。
         """
         if isinstance(tool_result, ToolMessage):
             resolved_backend = self._get_backend(runtime)
@@ -1333,14 +1353,17 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
         request: ToolCallRequest,
         handler: Callable[[ToolCallRequest], ToolMessage | Command],
     ) -> ToolMessage | Command:
-        """Check the size of the tool call result and evict to filesystem if too large.
+        """检查工具调用结果大小，若超限则卸载到文件系统（同步版本）。
+
+        对排除列表中的工具（ls/glob/grep/read_file/edit_file/write_file）直接透传，
+        其余工具的结果若超出 token 限制则触发卸载逻辑。
 
         Args:
-            request: The tool call request being processed.
-            handler: The handler function to call with the modified request.
+            request: 正在处理的工具调用请求。
+            handler: 使用请求调用的处理函数。
 
         Returns:
-            The raw ToolMessage, or a pseudo tool message with the ToolResult in state.
+            原始 ToolMessage，或包含卸载后文件引用的 Command。
         """
         if self._tool_token_limit_before_evict is None or request.tool_call["name"] in TOOLS_EXCLUDED_FROM_EVICTION:
             return handler(request)
@@ -1353,14 +1376,14 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
         request: ToolCallRequest,
         handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command]],
     ) -> ToolMessage | Command:
-        """(async)Check the size of the tool call result and evict to filesystem if too large.
+        """检查工具调用结果大小，若超限则卸载到文件系统（异步版本）。
 
         Args:
-            request: The tool call request being processed.
-            handler: The handler function to call with the modified request.
+            request: 正在处理的工具调用请求。
+            handler: 使用请求调用的异步处理函数。
 
         Returns:
-            The raw ToolMessage, or a pseudo tool message with the ToolResult in state.
+            原始 ToolMessage，或包含卸载后文件引用的 Command。
         """
         if self._tool_token_limit_before_evict is None or request.tool_call["name"] in TOOLS_EXCLUDED_FROM_EVICTION:
             return await handler(request)
