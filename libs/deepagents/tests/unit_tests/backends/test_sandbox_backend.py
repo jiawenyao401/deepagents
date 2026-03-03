@@ -35,7 +35,7 @@ class MockSandbox(BaseSandbox):
     def id(self) -> str:
         return "mock-sandbox"
 
-    def execute(self, command: str) -> ExecuteResponse:
+    def execute(self, command: str, *, timeout: int | None = None) -> ExecuteResponse:
         self.last_command = command
         # Return "1" for edit commands (simulates 1 occurrence replaced)
         return ExecuteResponse(output="1", exit_code=0, truncated=False)
@@ -87,10 +87,24 @@ def test_glob_command_template_format() -> None:
 
 def test_read_command_template_format() -> None:
     """Test that _READ_COMMAND_TEMPLATE can be formatted without KeyError."""
-    cmd = _READ_COMMAND_TEMPLATE.format(file_path="/test/file.txt", offset=0, limit=100)
+    payload = json.dumps({"path": "/test/file.txt", "offset": 0, "limit": 100})
+    payload_b64 = base64.b64encode(payload.encode("utf-8")).decode("ascii")
+    cmd = _READ_COMMAND_TEMPLATE.format(payload_b64=payload_b64)
 
     assert "python3 -c" in cmd
-    assert "/test/file.txt" in cmd
+    assert payload_b64 in cmd
+    assert "__DEEPAGENTS_EOF__" in cmd
+
+
+def test_sandbox_read_uses_payload() -> None:
+    """Test that read() bundles all params into a single base64 payload."""
+    sandbox = MockSandbox()
+
+    sandbox.read("/test/file.txt", offset=5, limit=50)
+
+    assert sandbox.last_command is not None
+    assert "__DEEPAGENTS_EOF__" in sandbox.last_command
+    assert "/test/file.txt" not in sandbox.last_command
 
 
 def test_sandbox_write_method() -> None:
@@ -139,3 +153,38 @@ def test_sandbox_edit_with_special_strings() -> None:
     sandbox.edit("/test/file.txt", old_string, new_string, replace_all=True)
 
     assert sandbox.last_command is not None
+
+
+def test_sandbox_grep_literal_search() -> None:
+    """Test that grep performs literal search using grep -F flag."""
+    sandbox = MockSandbox()
+
+    # Override execute to return mock grep results
+    def mock_execute(command: str) -> ExecuteResponse:
+        sandbox.last_command = command
+        # Return mock grep output for literal search tests
+        if "grep" in command:
+            # Check that -F flag (fixed-strings/literal) is present in the flags
+            # -F can appear as standalone "-F" or combined like "-rHnF"
+            assert "-F" in command or "F" in command.split("grep", 1)[1].split(maxsplit=1)[0], "grep should use -F flag for literal search"
+            return ExecuteResponse(
+                output="/test/code.py:1:def __init__(self):\n/test/types.py:1:str | int",
+                exit_code=0,
+                truncated=False,
+            )
+        return ExecuteResponse(output="", exit_code=0, truncated=False)
+
+    sandbox.execute = mock_execute
+
+    # Test with parentheses (should be literal, not regex grouping)
+    matches = sandbox.grep_raw("def __init__(", path="/test")
+    assert isinstance(matches, list)
+    assert len(matches) == 2
+
+    # Test with pipe character (should be literal, not regex OR)
+    matches = sandbox.grep_raw("str | int", path="/test")
+    assert isinstance(matches, list)
+
+    # Verify the command uses grep -rHnF for literal search (combined flags)
+    assert sandbox.last_command is not None
+    assert "grep -rHnF" in sandbox.last_command

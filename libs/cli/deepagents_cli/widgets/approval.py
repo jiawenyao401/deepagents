@@ -2,17 +2,30 @@
 
 from __future__ import annotations
 
-import asyncio
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
-from textual import events
-from textual.app import ComposeResult
+from rich.markup import escape as escape_markup
 from textual.binding import Binding, BindingType
 from textual.containers import Container, Vertical, VerticalScroll
 from textual.message import Message
 from textual.widgets import Static
 
+if TYPE_CHECKING:
+    import asyncio
+
+    from textual import events
+    from textual.app import ComposeResult
+
+from deepagents_cli.config import (
+    SHELL_TOOL_NAMES,
+    CharsetMode,
+    _detect_charset_mode,
+    get_glyphs,
+)
 from deepagents_cli.widgets.tool_renderers import get_renderer
+
+# Max length for truncated shell command display
+_SHELL_COMMAND_TRUNCATE_LENGTH: int = 120
 
 
 class ApprovalMenu(Container):
@@ -44,25 +57,43 @@ class ApprovalMenu(Container):
         Binding("n", "select_reject", "Reject", show=False),
         Binding("3", "select_auto", "Auto-approve", show=False),
         Binding("a", "select_auto", "Auto-approve", show=False),
+        Binding("e", "toggle_expand", "Expand command", show=False),
     ]
 
     class Decided(Message):
         """Message sent when user makes a decision."""
 
         def __init__(self, decision: dict[str, str]) -> None:
+            """Initialize a Decided message with the user's decision.
+
+            Args:
+                decision: Dictionary containing the decision type (e.g., 'approve',
+                    'reject', or 'auto_approve_all').
+            """
             super().__init__()
             self.decision = decision
 
     # Tools that don't need detailed info display (already shown in tool call)
-    _MINIMAL_TOOLS: ClassVar[set[str]] = {"bash", "shell"}
+    _MINIMAL_TOOLS: ClassVar[frozenset[str]] = SHELL_TOOL_NAMES
 
     def __init__(
         self,
         action_requests: list[dict[str, Any]] | dict[str, Any],
         _assistant_id: str | None = None,
-        id: str | None = None,  # noqa: A002
+        id: str | None = None,  # noqa: A002  # Textual widget constructor uses `id` parameter
         **kwargs: Any,
     ) -> None:
+        """Initialize the ApprovalMenu widget.
+
+        Args:
+            action_requests: A single action request dictionary or a list of action
+                request dictionaries requiring approval. Each dictionary should
+                contain 'name' (tool name) and 'args' (tool arguments).
+            _assistant_id: Optional assistant ID (currently unused, reserved for
+                future use).
+            id: Optional widget ID. Defaults to 'approval-menu'.
+            **kwargs: Additional keyword arguments passed to the Container base class.
+        """
         super().__init__(id=id or "approval-menu", classes="approval-menu", **kwargs)
         # Support both single request (legacy) and list of requests (batch)
         if isinstance(action_requests, dict):
@@ -78,16 +109,63 @@ class ApprovalMenu(Container):
         self._tool_info_container: Vertical | None = None
         # Minimal display if ALL tools are bash/shell
         self._is_minimal = all(name in self._MINIMAL_TOOLS for name in self._tool_names)
+        # For expandable shell commands
+        self._command_expanded = False
+        self._command_widget: Static | None = None
+        self._has_expandable_command = self._check_expandable_command()
 
     def set_future(self, future: asyncio.Future[dict[str, str]]) -> None:
         """Set the future to resolve when user decides."""
         self._future = future
+
+    def _check_expandable_command(self) -> bool:
+        """Check if there's a shell command that can be expanded.
+
+        Returns:
+            Whether the single action request is an expandable shell command.
+        """
+        if len(self._action_requests) != 1:
+            return False
+        req = self._action_requests[0]
+        if req.get("name", "") not in SHELL_TOOL_NAMES:
+            return False
+        command = str(req.get("args", {}).get("command", ""))
+        return len(command) > _SHELL_COMMAND_TRUNCATE_LENGTH
+
+    def _get_command_display(self, *, expanded: bool) -> str:
+        """Get the command display string (truncated or full).
+
+        Args:
+            expanded: Whether to show the full command or truncated version.
+
+        Returns:
+            Formatted command string with Rich markup.
+
+        Raises:
+            RuntimeError: If called with empty action_requests.
+        """
+        if not self._action_requests:
+            msg = "_get_command_display called with empty action_requests"
+            raise RuntimeError(msg)
+        req = self._action_requests[0]
+        command = str(req.get("args", {}).get("command", ""))
+        if expanded or len(command) <= _SHELL_COMMAND_TRUNCATE_LENGTH:
+            return f"[bold #f59e0b]{escape_markup(command)}[/bold #f59e0b]"
+        truncated = command[:_SHELL_COMMAND_TRUNCATE_LENGTH] + get_glyphs().ellipsis
+        escaped_truncated = escape_markup(truncated)
+        return (
+            f"[bold #f59e0b]{escaped_truncated}[/bold #f59e0b] "
+            "[dim](press 'e' to expand)[/dim]"
+        )
 
     def compose(self) -> ComposeResult:
         """Compose the widget with Static children.
 
         Layout: Tool info first (what's being approved), then options at bottom.
         For bash/shell, skip tool info since it's already shown in tool call.
+
+        Yields:
+            Widgets for title, tool info, options, and help text.
         """
         # Title - show count if multiple tools
         count = len(self._action_requests)
@@ -97,6 +175,14 @@ class ApprovalMenu(Container):
             title = f">>> {count} Tool Calls Require Approval <<<"
         yield Static(title, classes="approval-title")
 
+        # For shell commands, show the command (expandable if long)
+        if self._is_minimal and len(self._action_requests) == 1:
+            self._command_widget = Static(
+                self._get_command_display(expanded=self._command_expanded),
+                classes="approval-command",
+            )
+            yield self._command_widget
+
         # Tool info - only for non-minimal tools (diffs, writes show actual content)
         if not self._is_minimal:
             with VerticalScroll(classes="tool-info-scroll"):
@@ -104,24 +190,32 @@ class ApprovalMenu(Container):
                 yield self._tool_info_container
 
             # Separator between tool details and options
-            yield Static("─" * 40, classes="approval-separator")
+            glyphs = get_glyphs()
+            yield Static(glyphs.box_horizontal * 40, classes="approval-separator")
 
         # Options container at bottom
         with Container(classes="approval-options-container"):
             # Options - create 3 Static widgets
-            for i in range(3):
+            for i in range(3):  # noqa: B007  # Loop variable unused - iterating for count only
                 widget = Static("", classes="approval-option")
                 self._option_widgets.append(widget)
                 yield widget
 
         # Help text at the very bottom
-        yield Static(
-            "↑/↓ navigate • Enter select • y/n/a quick keys",
-            classes="approval-help",
+        glyphs = get_glyphs()
+        help_text = (
+            f"{glyphs.arrow_up}/{glyphs.arrow_down} navigate {glyphs.bullet} "
+            f"Enter select {glyphs.bullet} y/n/a quick keys {glyphs.bullet} Esc reject"
         )
+        if self._has_expandable_command:
+            help_text += f" {glyphs.bullet} e expand"
+        yield Static(help_text, classes="approval-help")
 
     async def on_mount(self) -> None:
         """Focus self on mount and update tool info."""
+        if _detect_charset_mode() == CharsetMode.ASCII:
+            self.styles.border = ("ascii", "yellow")
+
         if not self._is_minimal:
             await self._update_tool_info()
         self._update_options()
@@ -145,6 +239,15 @@ class ApprovalMenu(Container):
                 header = Static(f"[bold]{i + 1}. {tool_name}[/bold]")
                 await self._tool_info_container.mount(header)
 
+            # Show description if present
+            description = action_request.get("description")
+            if description:
+                desc_widget = Static(
+                    f"[dim]{description}[/dim]",
+                    classes="approval-description",
+                )
+                await self._tool_info_container.mount(desc_widget)
+
             # Get the appropriate renderer for this tool
             renderer = get_renderer(tool_name)
             widget_class, data = renderer.get_approval_widget(tool_args)
@@ -158,17 +261,19 @@ class ApprovalMenu(Container):
             options = [
                 "1. Approve (y)",
                 "2. Reject (n)",
-                "3. Auto-approve all this session (a)",
+                "3. Auto-approve for this thread (a)",
             ]
         else:
             options = [
                 f"1. Approve all {count} (y)",
                 f"2. Reject all {count} (n)",
-                "3. Auto-approve all this session (a)",
+                "3. Auto-approve for this thread (a)",
             ]
 
-        for i, (text, widget) in enumerate(zip(options, self._option_widgets, strict=True)):
-            cursor = "› " if i == self._selected else "  "
+        for i, (text, widget) in enumerate(
+            zip(options, self._option_widgets, strict=True)
+        ):
+            cursor = f"{get_glyphs().cursor} " if i == self._selected else "  "
             widget.update(f"{cursor}{text}")
 
             # Update classes
@@ -208,6 +313,15 @@ class ApprovalMenu(Container):
         self._update_options()
         self._handle_selection(2)
 
+    def action_toggle_expand(self) -> None:
+        """Toggle shell command expansion."""
+        if not self._has_expandable_command or not self._command_widget:
+            return
+        self._command_expanded = not self._command_expanded
+        self._command_widget.update(
+            self._get_command_display(expanded=self._command_expanded)
+        )
+
     def _handle_selection(self, option: int) -> None:
         """Handle the selected option."""
         decision_map = {
@@ -224,6 +338,6 @@ class ApprovalMenu(Container):
         # Post message
         self.post_message(self.Decided(decision))
 
-    def on_blur(self, event: events.Blur) -> None:
+    def on_blur(self, event: events.Blur) -> None:  # noqa: ARG002  # Textual event handler signature
         """Re-focus on blur to keep focus trapped until decision is made."""
         self.call_after_refresh(self.focus)

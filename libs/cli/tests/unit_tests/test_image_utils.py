@@ -1,7 +1,11 @@
-"""Tests for image utilities (clipboard detection, base64 encoding, multimodal content)."""
+"""Tests for image utilities.
+
+Covers clipboard detection, base64 encoding, and multimodal content.
+"""
 
 import base64
 import io
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from PIL import Image
@@ -11,6 +15,7 @@ from deepagents_cli.image_utils import (
     create_multimodal_content,
     encode_image_to_base64,
     get_clipboard_image,
+    get_image_from_path,
 )
 from deepagents_cli.input import ImageTracker
 
@@ -103,21 +108,31 @@ class TestImageTracker:
 
         assert placeholder == "[image 1]"
 
-    def test_remove_image_and_reset_counter(self) -> None:
-        """Test removing an image resets the counter appropriately."""
+    def test_sync_to_text_resets_when_placeholders_removed(self) -> None:
+        """Removing placeholders from input should clear tracked images and IDs."""
+        tracker = ImageTracker()
+        img = ImageData(base64_data="abc", format="png", placeholder="")
+
+        tracker.add_image(img)
+        tracker.add_image(img)
+        tracker.sync_to_text("")
+
+        assert tracker.images == []
+        assert tracker.next_id == 1
+
+    def test_sync_to_text_keeps_referenced_images(self) -> None:
+        """Sync should prune unreferenced images while preserving next ID order."""
         tracker = ImageTracker()
         img1 = ImageData(base64_data="abc", format="png", placeholder="")
         img2 = ImageData(base64_data="def", format="png", placeholder="")
 
         tracker.add_image(img1)
         tracker.add_image(img2)
+        tracker.sync_to_text("keep [image 2] only")
 
-        # Simulate what happens on backspace delete
-        tracker.images.pop(1)  # Remove image 2
-        tracker.next_id = len(tracker.images) + 1
-
-        assert tracker.next_id == 2
+        assert tracker.next_id == 3
         assert len(tracker.images) == 1
+        assert tracker.images[0].placeholder == "[image 2]"
 
 
 class TestEncodeImageToBase64:
@@ -201,10 +216,13 @@ class TestGetClipboardImage:
     """Tests for clipboard image detection."""
 
     @patch("deepagents_cli.image_utils.sys.platform", "linux")
-    def test_unsupported_platform_returns_none(self) -> None:
-        """Test that non-macOS platforms return None."""
-        result = get_clipboard_image()
-        assert result is None
+    def test_unsupported_platform_returns_none_and_warns(self) -> None:
+        """Test that non-macOS platforms return None and log a warning."""
+        with patch("deepagents_cli.image_utils.logger") as mock_logger:
+            result = get_clipboard_image()
+            assert result is None
+            mock_logger.warning.assert_called_once()
+            assert "linux" in mock_logger.warning.call_args[0][1]
 
     @patch("deepagents_cli.image_utils.sys.platform", "darwin")
     @patch("deepagents_cli.image_utils._get_macos_clipboard_image")
@@ -216,8 +234,14 @@ class TestGetClipboardImage:
 
     @patch("deepagents_cli.image_utils.sys.platform", "darwin")
     @patch("deepagents_cli.image_utils.subprocess.run")
-    def test_pngpaste_success(self, mock_run: MagicMock) -> None:
+    @patch("deepagents_cli.image_utils._get_executable")
+    def test_pngpaste_success(
+        self, mock_get_executable: MagicMock, mock_run: MagicMock
+    ) -> None:
         """Test successful image retrieval via pngpaste."""
+        # Mock _get_executable to return a path for pngpaste
+        mock_get_executable.return_value = "/usr/local/bin/pngpaste"
+
         # Create a small valid PNG
         img = Image.new("RGB", (10, 10), color="blue")
         buffer = io.BytesIO()
@@ -237,26 +261,32 @@ class TestGetClipboardImage:
 
     @patch("deepagents_cli.image_utils.sys.platform", "darwin")
     @patch("deepagents_cli.image_utils.subprocess.run")
-    def test_pngpaste_not_installed_falls_back(self, mock_run: MagicMock) -> None:
+    @patch("deepagents_cli.image_utils._get_executable")
+    def test_pngpaste_not_installed_falls_back(
+        self, mock_get_executable: MagicMock, mock_run: MagicMock
+    ) -> None:
         """Test fallback to osascript when pngpaste is not installed."""
-        # First call (pngpaste) raises FileNotFoundError
-        # Second call (osascript clipboard info) returns no image info
-        mock_run.side_effect = [
-            FileNotFoundError("pngpaste not found"),
-            MagicMock(returncode=0, stdout="text data"),  # clipboard info - no pngf
-        ]
+        # pngpaste not found, but osascript is available
+        mock_get_executable.side_effect = lambda name: (
+            "/usr/bin/osascript" if name == "osascript" else None
+        )
+
+        # osascript clipboard info returns no image info (no "pngf" in output)
+        mock_run.return_value = MagicMock(returncode=0, stdout="text data")
 
         result = get_clipboard_image()
 
         # Should return None since clipboard has no image
         assert result is None
-        # Should have tried both methods
-        assert mock_run.call_count == 2
+        # Should have tried osascript (clipboard info check)
+        assert mock_run.call_count == 1
 
     @patch("deepagents_cli.image_utils.sys.platform", "darwin")
     @patch("deepagents_cli.image_utils._get_clipboard_via_osascript")
     @patch("deepagents_cli.image_utils.subprocess.run")
-    def test_no_image_in_clipboard(self, mock_run: MagicMock, mock_osascript: MagicMock) -> None:
+    def test_no_image_in_clipboard(
+        self, mock_run: MagicMock, mock_osascript: MagicMock
+    ) -> None:
         """Test behavior when clipboard has no image."""
         # pngpaste fails
         mock_run.return_value = MagicMock(returncode=1, stdout=b"")
@@ -265,3 +295,66 @@ class TestGetClipboardImage:
 
         result = get_clipboard_image()
         assert result is None
+
+
+class TestGetImageFromPath:
+    """Tests for loading local images from dropped file paths."""
+
+    def test_get_image_from_path_png(self, tmp_path: Path) -> None:
+        """Valid PNG files should be returned as ImageData."""
+        img_path = tmp_path / "dropped.png"
+        img = Image.new("RGB", (4, 4), color="red")
+        img.save(img_path, format="PNG")
+
+        result = get_image_from_path(img_path)
+
+        assert result is not None
+        assert result.format == "png"
+        assert result.placeholder == "[image]"
+        assert base64.b64decode(result.base64_data)
+
+    def test_get_image_from_path_non_image_returns_none(self, tmp_path: Path) -> None:
+        """Non-image files should be ignored."""
+        file_path = tmp_path / "notes.txt"
+        file_path.write_text("not an image")
+
+        assert get_image_from_path(file_path) is None
+
+    def test_get_image_from_path_missing_returns_none(self, tmp_path: Path) -> None:
+        """Missing files should return None instead of raising."""
+        file_path = tmp_path / "missing.png"
+        assert get_image_from_path(file_path) is None
+
+    def test_get_image_from_path_jpeg_normalizes_format(self, tmp_path: Path) -> None:
+        """JPEG images should normalize 'JPEG' format to 'jpeg'."""
+        img_path = tmp_path / "photo.jpg"
+        img = Image.new("RGB", (4, 4), color="green")
+        img.save(img_path, format="JPEG")
+
+        result = get_image_from_path(img_path)
+
+        assert result is not None
+        assert result.format == "jpeg"
+
+
+class TestSyncToTextWithIDGaps:
+    """Tests for ImageTracker.sync_to_text with non-contiguous IDs."""
+
+    def test_sync_to_text_with_id_gap_preserves_max_id(self) -> None:
+        """Deleting the middle image should set next_id based on max surviving ID."""
+        tracker = ImageTracker()
+        img1 = ImageData(base64_data="a", format="png", placeholder="")
+        img2 = ImageData(base64_data="b", format="png", placeholder="")
+        img3 = ImageData(base64_data="c", format="png", placeholder="")
+
+        tracker.add_image(img1)
+        tracker.add_image(img2)
+        tracker.add_image(img3)
+
+        # Remove the middle placeholder — IDs 1 and 3 remain
+        tracker.sync_to_text("[image 1] and [image 3]")
+
+        assert len(tracker.images) == 2
+        assert tracker.images[0].placeholder == "[image 1]"
+        assert tracker.images[1].placeholder == "[image 3]"
+        assert tracker.next_id == 4

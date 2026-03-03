@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path  # noqa: TC003 - used at runtime in type hints
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 class HistoryManager:
@@ -145,6 +148,11 @@ class HistoryManager:
         result = self._temp_input
         self.reset_navigation()
         return result
+
+    @property
+    def in_history(self) -> bool:
+        """Whether currently navigating history entries."""
+        return self._current_index >= 0
 
     def reset_navigation(self) -> None:
         """Reset navigation state."""

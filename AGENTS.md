@@ -14,7 +14,10 @@ deepagents/
 │   ├── deepagents/  # SDK
 │   ├── cli/         # CLI tool
 │   ├── acp/         # Agent Context Protocol support
-│   └── harbor/      # Evaluation/benchmark framework
+│   ├── harbor/      # Evaluation/benchmark framework
+│   └── partners/    # Integration packages
+│       └── daytona/
+│       └── ...
 ├── .github/         # CI/CD workflows and templates
 └── README.md        # Information about Deep Agents
 ```
@@ -24,7 +27,28 @@ deepagents/
 - `uv` – Fast Python package installer and resolver (replaces pip/poetry)
 - `make` – Task runner for common development commands. Feel free to look at the `Makefile` for available commands and usage patterns.
 - `ruff` – Fast Python linter and formatter
-- `mypy` – Static type checking
+- `ty` – Static type checking
+
+#### Suppressing ruff lint rules
+
+Prefer inline `# noqa: RULE` over `[tool.ruff.lint.per-file-ignores]` for individual exceptions. `per-file-ignores` silences a rule for the *entire* file — If you add it for one violation, all future violations of that rule in the same file are silently ignored. Inline `# noqa` is precise to the line, self-documenting, and keeps the safety net intact for the rest of the file.
+
+Reserve `per-file-ignores` for **categorical policy** that applies to a whole class of files (e.g., `"tests/**" = ["D1", "S101"]` — tests don't need docstrings, `assert` is expected). These are not exceptions; they are different rules for a different context.
+
+```toml
+# GOOD – categorical policy in pyproject.toml
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["D1", "S101"]
+
+# BAD – single-line exception buried in pyproject.toml
+"deepagents_cli/agent.py" = ["PLR2004"]
+```
+
+```python
+# GOOD – precise, self-documenting inline suppression
+timeout = 30  # noqa: PLR2004  # default HTTP timeout, not arbitrary
+```
+
 - `pytest` – Testing framework
 
 This monorepo uses `uv` for dependency management. Local development uses editable installs: `[tool.uv.sources]`
@@ -45,9 +69,6 @@ make lint
 
 # Format code
 make format
-
-# Type checking
-uv run --group lint mypy .
 ```
 
 #### Key config files
@@ -111,6 +132,8 @@ def filter_unknown_users(users: list[str], known_users: set[str]) -> list[str]:
 - Use descriptive, self-explanatory variable names.
 - Follow existing patterns in the codebase you're modifying
 - Attempt to break up complex functions (>20 lines) into smaller, focused functions where it makes sense
+- Avoid using the `any` type
+- Prefer single word variable names where possible
 
 ### Testing requirements
 
@@ -120,15 +143,14 @@ Every new feature or bugfix MUST be covered by unit tests.
 - Integration tests: `tests/integration_tests/` (network calls permitted)
 - We use `pytest` as the testing framework; if in doubt, check other existing tests for examples.
 - The testing file structure should mirror the source code structure.
+- Avoid mocks as much as possible
+- Test actual implementation, do not duplicate logic into tests
 
-**Checklist:**
+Ensure the following:
 
-- [ ] Tests fail when your new logic is broken
-- [ ] Happy path is covered
-- [ ] Edge cases and error conditions are tested
-- [ ] Use fixtures/mocks for external dependencies
-- [ ] Tests are deterministic (no flaky tests)
-- [ ] Does the test suite fail if your new logic is broken?
+- Does the test suite fail if your new logic is broken?
+- Edge cases and error conditions are tested
+- Tests are deterministic (no flaky tests)
 
 ### Security and risk assessment
 
@@ -168,8 +190,46 @@ def send_email(to: str, msg: str, *, priority: str = "normal") -> bool:
 - Document all parameters, return values, and exceptions
 - Keep descriptions concise but clear
 - Ensure American English spelling (e.g., "behavior", not "behaviour")
+- Do NOT use Sphinx-style double backtick formatting (` ``code`` `). Use single backticks (`` `code` ``) for inline code references in docstrings and comments.
+
+## Package-specific guidance
+
+### Deep Agents CLI (`libs/cli/`)
+
+`deepagents-cli` uses [Textual](https://textual.textualize.io/) for its terminal UI framework.
+
+**Key Textual resources:**
+
+- **Guide:** https://textual.textualize.io/guide/
+- **Widget gallery:** https://textual.textualize.io/widget_gallery/
+- **CSS reference:** https://textual.textualize.io/styles/
+- **API reference:** https://textual.textualize.io/api/
+
+**Textual patterns used in this codebase:**
+
+- **Workers** (`@work` decorator) for async operations - see [Workers guide](https://textual.textualize.io/guide/workers/)
+- **Message passing** for widget communication - see [Events guide](https://textual.textualize.io/guide/events/)
+- **Reactive attributes** for state management - see [Reactivity guide](https://textual.textualize.io/guide/reactivity/)
+
+**Startup performance:**
+
+The CLI must stay fast to launch. Never import heavy packages (e.g., `deepagents`, LangChain, LangGraph) at module level or in the argument-parsing path. These imports pull in large dependency trees and add seconds to every invocation, including trivial commands like `deepagents -v`.
+
+- Keep top-level imports in `main.py` and other entry-point modules minimal.
+- Defer heavy imports to the point where they are actually needed (inside functions/methods).
+- To read another package's version without importing it, use `importlib.metadata.version("package-name")`.
+
+**Building chat/streaming interfaces:**
+
+- Blog post: [Anatomy of a Textual User Interface](https://textual.textualize.io/blog/2024/09/15/anatomy-of-a-textual-user-interface/) - demonstrates building an AI chat interface with streaming responses
+
+**Testing Textual apps:**
+
+- Use `textual.pilot` for async UI testing - see [Testing guide](https://textual.textualize.io/guide/testing/)
+- Snapshot testing available for visual regression - see repo `notes/snapshot_testing.md`
 
 ## Additional resources
 
-- **Documentation:** https://docs.langchain.com/oss/python/deeoagebts/overview and source at https://github.com/langchain-ai/docs or `../docs/`. Prefer the local install and use file search tools for best results. If needed, use the docs MCP server as defined in `.mcp.json` for programmatic access.
+- **Documentation:** https://docs.langchain.com/oss/python/deepagents/overview and source at https://github.com/langchain-ai/docs or `../docs/`. Prefer the local install and use file search tools for best results. If needed, use the docs MCP server as defined in `.mcp.json` for programmatic access.
 - **Contributing Guide:** [Contributing Guide](https://docs.langchain.com/oss/python/contributing/overview)
+- **CLI Release Process:** See `.github/RELEASING.md` for the full CLI release workflow (release-please, version bumping, troubleshooting failed releases, and label management).

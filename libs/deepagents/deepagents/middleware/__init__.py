@@ -5,7 +5,7 @@ from deepagents.middleware.memory import MemoryMiddleware
 from deepagents.middleware.openai_compat import OpenAICompatMiddleware
 from deepagents.middleware.skills import SkillsMiddleware
 from deepagents.middleware.subagents import CompiledSubAgent, SubAgent, SubAgentMiddleware
-from deepagents.middleware.summarization import SummarizationMiddleware
+from deepagents.middleware.summarization import SummarizationMiddleware, SummarizationToolMiddleware
 
 __all__ = [
     "CompiledSubAgent",
@@ -16,4 +16,5 @@ __all__ = [
     "SubAgent",
     "SubAgentMiddleware",
     "SummarizationMiddleware",
+    "SummarizationToolMiddleware",
 ]
