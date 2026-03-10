@@ -1,31 +1,70 @@
-"""中间件模块，导出所有可用的中间件类。"""
+"""Middleware for the Deep Agents agent.
 
-# 文件系统中间件：提供 ls/read_file/write_file/edit_file/glob/grep/execute 等工具
+## Overview
+
+The LLM receives tools through two paths:
+
+1. **SDK middleware** (this package) -- tools, system-prompt injection, and
+   request interception that any SDK consumer gets automatically.
+2. **Consumer-provided tools** -- plain callable functions passed via the
+   `tools` parameter to `create_deep_agent()`. The CLI uses this path for
+   lightweight, consumer-specific tools.
+
+Both are merged by `create_deep_agent()` into the final tool set the LLM sees.
+
+## Why middleware instead of plain tools?
+
+Middleware subclasses `AgentMiddleware`, overriding its `wrap_model_call()`
+hook that **intercepts every LLM request** before it is sent. This lets
+middleware:
+
+* **Filter tools dynamically** -- e.g. `FilesystemMiddleware` removes the
+  `execute` tool at call-time when the resolved backend doesn't support it.
+* **Inject system-prompt context** -- e.g. `MemoryMiddleware` and
+  `SkillsMiddleware` inject relevant instructions into the system message on
+  every call so the LLM knows how to use the tools they provide.
+* **Transform messages** -- e.g. `SummarizationMiddleware` counts tokens,
+  truncates old tool arguments, and replaces history with summaries when the
+  context window fills up.
+* **Maintain cross-turn state** -- middleware can read/write a typed state
+  dict that persists across agent turns (e.g. summarization events).
+
+A plain tool function in a `tools=[]` list cannot do any of this -- it is
+only invoked *by* the LLM, not *before* the LLM call.
+
+## When to use each path
+
+Use **middleware** when the tool needs to:
+
+* Modify the system prompt or tool list per-call
+* Track state across turns
+* Be available to all SDK consumers (not just the CLI)
+
+Use a **plain tool** when:
+
+* The function is stateless and self-contained
+* No system-prompt or request modification is needed
+* The tool is specific to a single consumer (e.g. CLI-only)
+"""
+
 from deepagents.middleware.filesystem import FilesystemMiddleware
-
-# 记忆中间件：从 AGENTS.md 文件加载持久化上下文并注入系统提示
 from deepagents.middleware.memory import MemoryMiddleware
-
-# OpenAI 兼容中间件：将消息内容从数组格式转换为字符串格式，兼容旧版 OpenAI API
-from deepagents.middleware.openai_compat import OpenAICompatMiddleware
-
-# 技能中间件：加载并向系统提示暴露 Agent 技能（渐进式披露模式）
 from deepagents.middleware.skills import SkillsMiddleware
-
-# 子代理中间件：通过 task 工具向 Agent 提供子代理能力
 from deepagents.middleware.subagents import CompiledSubAgent, SubAgent, SubAgentMiddleware
-
-# 摘要中间件：自动压缩对话历史；工具版摘要中间件：提供手动触发压缩的工具
-from deepagents.middleware.summarization import SummarizationMiddleware, SummarizationToolMiddleware
+from deepagents.middleware.summarization import (
+    SummarizationMiddleware,
+    SummarizationToolMiddleware,
+    create_summarization_tool_middleware,
+)
 
 __all__ = [
     "CompiledSubAgent",
     "FilesystemMiddleware",
     "MemoryMiddleware",
-    "OpenAICompatMiddleware",
     "SkillsMiddleware",
     "SubAgent",
     "SubAgentMiddleware",
     "SummarizationMiddleware",
     "SummarizationToolMiddleware",
+    "create_summarization_tool_middleware",
 ]
